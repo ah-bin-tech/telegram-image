@@ -21,6 +21,8 @@ const I18N_DICT = {
     label_chat_id: 'Chat ID',
     hint_chat_id: '频道用户名或数字 ID，Bot 需为该频道管理员',
     label_template: '上传文件名模板',
+    label_worker_url: 'Worker 代理地址',
+    hint_worker_url: '可选。Cloudflare Worker 代理地址，用于隐藏文件链接中的 Bot Token',
     hint_template: '',
     cancel: '取消',
     save: '保存',
@@ -53,6 +55,8 @@ const I18N_DICT = {
     label_chat_id: 'Chat ID',
     hint_chat_id: 'Channel username or numeric ID. The bot must be an admin of the channel.',
     label_template: 'Upload Filename Template',
+    label_worker_url: 'Worker Proxy URL',
+    hint_worker_url: 'Optional. Cloudflare Worker proxy URL to hide Bot Token from file links',
     hint_template: '',
     cancel: 'Cancel',
     save: 'Save',
@@ -85,6 +89,8 @@ const I18N_DICT = {
     label_chat_id: 'Chat ID',
     hint_chat_id: 'チャンネルのユーザー名または数値ID。Botがチャンネル管理者である必要があります。',
     label_template: 'ファイル名テンプレート',
+    label_worker_url: 'Worker プロキシURL',
+    hint_worker_url: 'オプション。ファイルリンクからBot Tokenを隠すためのCloudflare WorkerプロキシURL',
     hint_template: '',
     cancel: 'キャンセル',
     save: '保存',
@@ -150,7 +156,7 @@ class ConfigManager {
       const raw = localStorage.getItem(this.STORAGE_KEY);
       if (raw) return JSON.parse(raw);
     } catch { /* corrupted data */ }
-    return { token: '', chatId: '', lang: 'zh-CN', theme: 'light', template: '[name]_[hash:6].[ext]' };
+    return { token: '', chatId: '', lang: 'zh-CN', theme: 'light', template: '[name]_[hash:6].[ext]', workerUrl: '' };
   }
 
   /** @param {Partial<ReturnType<ConfigManager['getAll']>>} partial */
@@ -167,6 +173,7 @@ class ConfigManager {
   get lang() { return this.getAll().lang; }
   get theme() { return this.getAll().theme; }
   get template() { return this.getAll().template; }
+  get workerUrl() { return this.getAll().workerUrl; }
   get isConfigured() { return !!(this.token && this.chatId); }
 }
 
@@ -289,7 +296,7 @@ class TelegramClient {
    * Upload a file to Telegram.
    * @param {File} file
    * @param {string} generatedName — template-processed filename
-   * @returns {Promise<{ url: string, fileId: string, messageId: number }>}
+   * @returns {Promise<{ url: string, filePath: string, fileId: string, messageId: number }>}
    */
   async upload(file, generatedName) {
     const method = getUploadMethod(file);
@@ -342,14 +349,14 @@ class TelegramClient {
       throw new Error('Could not extract file_id from Telegram response');
     }
 
-    const fileUrl = await this.getFileUrl(fileId);
-    return { url: fileUrl, fileId, messageId: result.message_id };
+    const { url: fileUrl, filePath } = await this.getFileUrl(fileId);
+    return { url: fileUrl, filePath, fileId, messageId: result.message_id };
   }
 
   /**
-   * Resolve a file_id to a public URL.
+   * Resolve a file_id to a public URL and file path.
    * @param {string} fileId
-   * @returns {Promise<string>}
+   * @returns {Promise<{ url: string, filePath: string }>}
    */
   async getFileUrl(fileId) {
     const res = await fetch(`${this.baseUrl}/getFile?file_id=${encodeURIComponent(fileId)}`);
@@ -357,7 +364,10 @@ class TelegramClient {
     if (!data.ok || !data.result?.file_path) {
       throw new Error('Failed to resolve file URL');
     }
-    return `https://api.telegram.org/file/bot${this.token}/${data.result.file_path}`;
+    return {
+      url: `https://api.telegram.org/file/bot${this.token}/${data.result.file_path}`,
+      filePath: data.result.file_path,
+    };
   }
 }
 
@@ -366,7 +376,7 @@ class TelegramClient {
 // ============================================================
 
 /**
- * @typedef {{ id: string, name: string, url: string, fileType: string, fileSize: number, uploadedAt: number, messageId: number }} UploadRecord
+ * @typedef {{ id: string, name: string, url: string, filePath: (string|undefined), fileType: string, fileSize: number, uploadedAt: number, messageId: number }} UploadRecord
  */
 
 class HistoryManager {
@@ -464,6 +474,7 @@ class App {
     /** @type {HTMLInputElement} */    this.inputToken = document.getElementById('bot-token');
     /** @type {HTMLInputElement} */    this.inputChatId = document.getElementById('chat-id');
     /** @type {HTMLInputElement} */    this.inputTemplate = document.getElementById('upload-template');
+    /** @type {HTMLInputElement} */    this.inputWorkerUrl = document.getElementById('worker-url');
     /** @type {HTMLDialogElement} */   this.previewDialog = document.getElementById('preview-dialog');
     /** @type {HTMLElement} */         this.previewName = document.getElementById('preview-name');
     /** @type {HTMLElement} */         this.previewBody = document.getElementById('preview-body');
@@ -614,12 +625,13 @@ class App {
     const card = document.createElement('div');
     card.className = 'gallery-card';
 
+    const displayUrl = this.#getDisplayUrl(rec);
     const isVideo = rec.fileType.startsWith('video/');
     const thumb = isVideo
       ? `<div class="gallery-card-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--color-text-tertiary)">
            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
          </div>`
-      : `<img class="gallery-card-thumb" src="${this.#escapeHtml(rec.url)}" alt="${this.#escapeHtml(rec.name)}" loading="lazy">`;
+      : `<img class="gallery-card-thumb" src="${this.#escapeHtml(displayUrl)}" alt="${this.#escapeHtml(rec.name)}" loading="lazy">`;
 
     const dateStr = dayjs(rec.uploadedAt).format('YYYY-MM-DD HH:mm');
 
@@ -644,7 +656,7 @@ class App {
       const target = /** @type {HTMLElement} */ (e.target);
       if (target.closest('[data-action="copy"]')) {
         e.stopPropagation();
-        navigator.clipboard.writeText(rec.url).then(() => {
+        navigator.clipboard.writeText(displayUrl).then(() => {
           this.toast.show(this.i18n.t('toast_url_copied'), 'success');
         });
         return;
@@ -668,12 +680,27 @@ class App {
     return div.innerHTML;
   }
 
+  /**
+   * Build the public URL for a record. Uses Worker proxy if configured,
+   * otherwise falls back to the direct Telegram URL.
+   * @param {UploadRecord} rec
+   * @returns {string}
+   */
+  #getDisplayUrl(rec) {
+    if (this.config.workerUrl && rec.filePath) {
+      const base = this.config.workerUrl.replace(/\/+$/, '');
+      return `${base}/file/${rec.filePath}`;
+    }
+    return rec.url;
+  }
+
   // ---- Settings ----
 
   #openSettings() {
     this.inputToken.value = this.config.token;
     this.inputChatId.value = this.config.chatId;
     this.inputTemplate.value = this.config.template;
+    this.inputWorkerUrl.value = this.config.workerUrl;
     this.settingsDialog.showModal();
   }
 
@@ -681,13 +708,14 @@ class App {
     const token = this.inputToken.value.trim();
     const chatId = this.inputChatId.value.trim();
     const template = this.inputTemplate.value.trim() || '[name]_[hash:6].[ext]';
+    const workerUrl = this.inputWorkerUrl.value.trim();
 
     if (!token || !chatId) {
       this.toast.show(this.i18n.t('toast_no_config'), 'error');
       return;
     }
 
-    this.config.save({ token, chatId, template });
+    this.config.save({ token, chatId, template, workerUrl });
     this.settingsDialog.close();
     this.toast.show(this.i18n.t('toast_config_saved'), 'success');
     this.#render();
@@ -733,6 +761,7 @@ class App {
         id: crypto.randomUUID(),
         name: generatedName,
         url: result.url,
+        filePath: result.filePath,
         fileType: file.type || 'application/octet-stream',
         fileSize: file.size,
         uploadedAt: Date.now(),
@@ -763,14 +792,15 @@ class App {
    * @param {UploadRecord} rec
    */
   #openPreview(rec) {
-    this.currentPreviewUrl = rec.url;
+    const displayUrl = this.#getDisplayUrl(rec);
+    this.currentPreviewUrl = displayUrl;
     this.previewName.textContent = rec.name;
 
     const isVideo = rec.fileType.startsWith('video/');
     if (isVideo) {
-      this.previewBody.innerHTML = `<video src="${this.#escapeHtml(rec.url)}" controls autoplay loop preload="metadata"></video>`;
+      this.previewBody.innerHTML = `<video src="${this.#escapeHtml(displayUrl)}" controls autoplay loop preload="metadata"></video>`;
     } else {
-      this.previewBody.innerHTML = `<img src="${this.#escapeHtml(rec.url)}" alt="${this.#escapeHtml(rec.name)}" loading="lazy">`;
+      this.previewBody.innerHTML = `<img src="${this.#escapeHtml(displayUrl)}" alt="${this.#escapeHtml(rec.name)}" loading="lazy">`;
     }
 
     this.previewDialog.showModal();

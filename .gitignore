@@ -17,3 +17,6 @@ desktop.ini
 
 # Local config backup
 tg_image_config*.json
+
+# Claude Code
+.claude/

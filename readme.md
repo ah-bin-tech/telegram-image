@@ -1,6 +1,6 @@
 # Telegram Image
 
-基于 Telegram Bot API 的纯前端图床应用。零构建步骤，浏览器打开即用。
+基于 Telegram Bot API 的纯前端图床应用。零构建步骤，浏览器打开即用。可选搭配 Cloudflare Worker 代理隐藏 Bot Token。
 
 ---
 
@@ -10,7 +10,8 @@
 telegram-image/
 ├── index.html          # 主页面 — 语义化 HTML5
 ├── style.css           # 样式 — CSS @layer + 自定义属性主题
-├── script.js           # 逻辑 — ES Module + JSDoc 类型标注
+├── script.js           # 逻辑 — ES Module + JSDoc 类型标注（~815 行）
+├── worker.js           # Cloudflare Worker — Token 代理（~38 行）
 ├── jsconfig.json       # VS Code 类型检查配置
 ├── plan.md             # 原始设计规划
 ├── readme.md           # 项目文档（本文件）
@@ -30,12 +31,13 @@ telegram-image/
 | 动画 | CSS `@keyframes`、ViewTransition API（主题切换） |
 | 存储 | `localStorage`（配置 + 上传历史，两个独立 key） |
 | 类型 | JSDoc 注释 + `jsconfig.json` |
+| 代理 | Cloudflare Worker（可选，用于隐藏文件链接中的 Bot Token） |
 
 ## 架构概览
 
 ```
-script.js （单文件，约 780 行）
-├── I18N_DICT          # 三语言字典（zh-CN / en / ja，各 27 个 key）
+script.js （单文件，~815 行）
+├── I18N_DICT          # 三语言字典（zh-CN / en / ja，各 29 个 key）
 ├── I18n               # 多语言切换，自动更新 [data-i18n] 元素
 ├── ConfigManager      # localStorage（key: tg_image_config）读写
 ├── ThemeManager       # 浅色/深色切换，ViewTransition 平滑过渡
@@ -44,9 +46,14 @@ script.js （单文件，约 780 行）
 ├── HistoryManager     # 上传历史（key: tg_image_history，最多 200 条）
 ├── Toast              # 轻量通知组件（success / error / info，3s 自动移除）
 └── App                # 主控制器 — 事件绑定、UI 渲染、上传编排
+
+worker.js （独立部署到 Cloudflare Workers）
+└── 反向代理 Telegram 文件请求，Token 仅存在于 Worker 环境变量
 ```
 
 ## 数据流
+
+### 上传
 
 ```
 用户选择文件（拖拽/点击/粘贴）
@@ -56,9 +63,21 @@ script.js （单文件，约 780 行）
     → TelegramClient.upload()
       → fetch POST → api.telegram.org/bot<token>/<method>
       → 解析响应提取 file_id
-      → getFileUrl() → https://api.telegram.org/file/bot<token>/<path>
-    → HistoryManager.add() 写入 localStorage
+      → getFileUrl() → 返回 { url, filePath }
+    → HistoryManager.add() 写入 localStorage（同时存 url 和 filePath）
     → #renderGallery() 刷新卡片列表
+```
+
+### 文件访问
+
+```
+未配置 Worker（默认）：
+  图片链接 = https://api.telegram.org/file/bot<TOKEN>/<path>   ← Token 暴露
+
+配置 Worker 后：
+  图片链接 = https://<your-worker>.workers.dev/file/<path>      ← Token 隐藏
+                │
+                └→ Worker 服务端拼接 Token → 代理到 Telegram
 ```
 
 ## 配置项
@@ -72,6 +91,7 @@ script.js （单文件，约 780 行）
 | `lang` | `"zh-CN"` \| `"en"` \| `"ja"` | `"zh-CN"` | 界面语言 |
 | `theme` | `"light"` \| `"dark"` | `"light"` | 主题 |
 | `template` | string | `"[name]_[hash:6].[ext]"` | 上传文件名模板 |
+| `workerUrl` | string | `""` | Cloudflare Worker 代理地址（可选） |
 
 ## 文件名模板变量
 
@@ -86,6 +106,18 @@ script.js （单文件，约 780 行）
 
 `/` 可在模板中表达目录层级，仅作标识用途（Telegram 服务端不保留目录结构）：
 `images/[date:YYYY/MM]/[name]_[hash:6].[ext]` → `images/2025/05/photo_a1b2c3.jpg`
+
+## Bot Token 安全
+
+Telegram Bot API 的设计中，文件下载 URL 必须包含 Bot Token。这意味着直接使用 Telegram 返回的文件链接会将 Token 暴露给所有能看到该链接的人。
+
+本项目通过可选的 Cloudflare Worker 代理解决此问题：
+
+1. 部署 `worker.js` 到 Cloudflare Workers，将 `BOT_TOKEN` 设为环境变量
+2. 在应用 Settings 中填入 Worker 地址（如 `https://your-worker.workers.dev`）
+3. 此后所有展示/复制的文件链接均指向 Worker，Token 仅存在于 Worker 服务端
+
+未配置 Worker 时，应用自动回退到 Telegram 原始链接，行为不变。
 
 ## 设计系统
 
@@ -172,7 +204,7 @@ script.js （单文件，约 780 行）
   <section#upload>      # 拖拽上传 + 进度条
   <section#gallery>     # CSS Grid 自适应卡片列表
 </main>
-<dialog#settings>  # 表单模态框（token、chatId、模板）
+<dialog#settings>  # 表单模态框（token、chatId、模板、Worker URL）
 <dialog#preview>   # 图片/视频预览 + 复制链接
 <div#toast>        # fixed 通知容器
 ```
@@ -198,6 +230,15 @@ script.js （单文件，约 780 行）
 1. 通过 [@BotFather](https://t.me/BotFather) 创建 Bot，获取 Token
 2. 创建公开频道，将 Bot 设为管理员
 3. 在页面 **Settings** 中填入 Token 和 Chat ID
+
+**隐藏 Bot Token（可选）：**
+
+4. 部署 `worker.js` 到 Cloudflare Workers：
+   ```bash
+   npx wrangler deploy
+   ```
+5. 在 Cloudflare Dashboard → Workers → Settings → Variables 中添加环境变量 `BOT_TOKEN`
+6. 在页面 **Settings** 中填入 Worker 代理地址（如 `https://your-worker.workers.dev`）
 
 ---
 
